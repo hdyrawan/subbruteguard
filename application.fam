@@ -1,0 +1,17 @@
+# For details & more options, see documentation/AppManifests.md in firmware repo
+
+App(
+    appid="subbruteguard",  # Must be unique
+    name="SubBruteGuard",  # Displayed in menus
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="subbruteguard_app",
+    stack_size=2 * 1024,
+    sources=["*.c*", "!tests"],
+    fap_category="Sub-GHz",
+    fap_version="0.1",
+    fap_icon="subbruteguard.png",  # 10x10 1-bit PNG
+    fap_description="Authorized audit tool: brute-forces fixed-code sub-GHz remotes on official firmware",
+    fap_author="hdyrawan",
+    fap_weburl="https://github.com/hdyrawan/subbruteguard",
+    fap_icon_assets="images",  # Image assets to compile for this application
+)
