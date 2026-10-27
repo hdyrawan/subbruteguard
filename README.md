@@ -31,16 +31,36 @@ SMC5326/UNILARM and PT2260/PT2262 each encode exactly 8 trinary digits plus
 a fixed gate suffix, so their real search space is 3^8 = 6561, not the
 2^24-2^25 their on-air bit width suggests — see `AGENTS.md` for why.
 
+## Jurisdiction / region picker
+
+Right after the intro screen, every launch shows a mandatory region picker:
+**Unrestricted (lab)**, **EU**, **US/CA/AU**, **Japan**, or **Indonesia**.
+This exists because the Flipper's own hardware region setting
+(`furi_hal_region`) only models those first four presets, has no entry for
+most countries including Indonesia, and was observed on a real test unit to
+be completely unprovisioned (`hardware_region_provisioned: --`) — a state
+that silently blocks every frequency, including ones every real region
+allows. Rather than let an absent or wrong hardware fuse make the app
+unusable, you tell it explicitly where you are; the app enforces that choice
+on every single transmit, not just at startup. The chosen region's badge
+(`EU`, `US`, `JP`, `ID`, or `LAB`) stays visible next to the title on every
+later screen. See `AGENTS.md` for exactly how this combines with the
+hardware's own region check, and where the Indonesia band table
+(314-316, 433-434.79, 920-923 MHz, from SDPPI Decree No. 260/2024) comes
+from.
+
 ## Controls
 
 | Key | Action |
 |---|---|
-| `Up` / `Down` | Pick protocol |
-| `Left` / `Right` | Pick frequency |
+| `Up` / `Down` (region picker) | Change jurisdiction |
+| `OK` (region picker) | Confirm and continue to the protocol/frequency picker |
+| `Up` / `Down` (picker) | Pick protocol |
+| `Left` / `Right` (picker) | Pick frequency |
 | `OK` long press | Arm and start the run from step 0 |
 | `OK` short press (while paused) | Resume the paused run from where it stopped |
 | `Back` (while running) | Pause, save a checkpoint |
-| `Back` (while picking or paused) | Exit |
+| `Back` (while picking, paused, or on the region screen) | Exit |
 
 Starting a run always requires a **long** press of OK. Browsing protocol and
 frequency only ever uses short presses, so the same gesture can never both
@@ -56,13 +76,15 @@ browse and arm the radio.
    frequency, preset, named protocol, bit count, and the candidate's 8-byte
    key — and handed to `subghz_transmitter_deserialize`, exactly like
    replaying a saved `.sub` file.
-4. Before every transmit, the frequency is checked against
-   `furi_hal_region_is_frequency_allowed` and
-   `furi_hal_subghz_is_frequency_valid`. A blocked frequency stops the run
-   with a plain on-screen reason instead of silently doing nothing.
-5. Every 50 candidates, progress (`{protocol, frequency, step}`) is saved to
-   `/ext/apps_data/subbruteguard/checkpoint.txt`, so a long run survives a
-   battery swap or an accidental exit without restarting the whole key space.
+4. Before every transmit, the frequency is checked against the CC1101's
+   tuning range, your chosen jurisdiction's band table, and (when the
+   hardware actually has one provisioned) the hardware's own region check.
+   A blocked frequency stops the run with a plain on-screen reason instead
+   of silently doing nothing.
+5. Every 50 candidates, progress (`{region, protocol, frequency, step}`) is
+   saved to `/ext/apps_data/subbruteguard/checkpoint.txt`, so a long run
+   survives a battery swap or an accidental exit without restarting the
+   whole key space.
 
 ## Install
 
@@ -85,9 +107,23 @@ and logs exactly what it transmits.
 
 ## Status
 
-v0.1. Builds and passes host logic tests. **Not yet exercised on hardware.**
-No screenshots yet — see `AGENTS.md`'s Definition of Done; hardware
-verification comes before screenshot capture, and this hasn't happened yet.
+v0.2. Builds and passes host logic tests.
+
+Verified on hardware: install, launch, intro screen, jurisdiction/region
+picker, protocol and frequency picker navigation (including wraparound),
+and the arm gesture, all via RPC-driven input and screenshots. A real
+on-hardware crash (`furi_check failed`) was found and fixed the first time
+an armed run actually tried to transmit — the TX path now matches official
+firmware's own `subghz tx` CLI command sequence; see `AGENTS.md` for the
+full root cause.
+
+The Running state (a confirmed successful transmit) has not been observed:
+the test device's hardware region is completely unprovisioned, and the
+stock `subghz tx` CLI command — not this app's code — refuses to transmit
+on any frequency as a result. That's confirmed to be a firmware-level
+safety interlock independent of any app, not a gap in subbruteguard. The
+in-app region picker still serves its purpose on properly-provisioned
+hardware. No screenshots captured yet toward the catalog format.
 
 ## License
 

@@ -119,6 +119,49 @@ static void test_protocol_table_sanity(void) {
     }
 }
 
+static void test_region_eu(void) {
+    CHECK(sbg_region_allows(SbgRegionEu, 433920000)); /* inside 433.05-434.79 */
+    CHECK(sbg_region_allows(SbgRegionEu, 868350000)); /* inside 868.15-868.55 */
+    CHECK(!sbg_region_allows(SbgRegionEu, 315000000)); /* EU has no 300MHz-ish band */
+    CHECK(!sbg_region_allows(SbgRegionEu, 915000000));
+}
+
+static void test_region_us_ca_au(void) {
+    CHECK(sbg_region_allows(SbgRegionUsCaAu, 307800000)); /* inside 304.1-321.95 */
+    CHECK(sbg_region_allows(SbgRegionUsCaAu, 433920000));
+    CHECK(sbg_region_allows(SbgRegionUsCaAu, 915000000)); /* band edge, inclusive */
+    CHECK(!sbg_region_allows(SbgRegionUsCaAu, 303875000)); /* just below 304.1 cutoff */
+    CHECK(!sbg_region_allows(SbgRegionUsCaAu, 868350000));
+}
+
+static void test_region_indonesia(void) {
+    CHECK(sbg_region_allows(SbgRegionIndonesia, 315000000)); /* inside 314-316 */
+    CHECK(sbg_region_allows(SbgRegionIndonesia, 433920000)); /* inside 433-434.79 */
+    CHECK(!sbg_region_allows(SbgRegionIndonesia, 303875000));
+    CHECK(!sbg_region_allows(SbgRegionIndonesia, 868350000)); /* no EU-style 868 band */
+    CHECK(!sbg_region_allows(SbgRegionIndonesia, 918000000)); /* just below 920 cutoff */
+}
+
+static void test_region_unrestricted_covers_everything(void) {
+    for(int i = 0; i < SbgProtoCount; i++) {
+        const SbgProtocol* p = sbg_protocol((SbgProtocolId)i);
+        for(int f = 0; f < p->frequency_count; f++) {
+            CHECK(sbg_region_allows(SbgRegionUnrestricted, p->frequencies_hz[f]));
+        }
+    }
+}
+
+static void test_region_table_sanity(void) {
+    for(int i = 0; i < SbgRegionCount; i++) {
+        const SbgRegion* r = sbg_region((SbgRegionId)i);
+        CHECK(r->label != NULL);
+        CHECK(r->band_count > 0 && r->band_count <= SBG_MAX_BANDS);
+        for(uint8_t b = 0; b < r->band_count; b++) {
+            CHECK(r->bands[b].start_hz < r->bands[b].end_hz);
+        }
+    }
+}
+
 int main(void) {
     test_total_steps();
     test_binary_candidate_is_step_itself();
@@ -127,6 +170,11 @@ int main(void) {
     test_candidate_hex_formatting();
     test_progress_formatting();
     test_protocol_table_sanity();
+    test_region_eu();
+    test_region_us_ca_au();
+    test_region_indonesia();
+    test_region_unrestricted_covers_everything();
+    test_region_table_sanity();
 
     if(failures == 0) {
         printf("All tests passed.\n");

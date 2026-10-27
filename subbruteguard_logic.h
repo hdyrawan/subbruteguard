@@ -83,3 +83,48 @@ bool sbg_candidate_hex(SbgProtocolId id, uint64_t step, char* out, size_t out_le
 /* Formats "step/total" compactly for the 128x64 display. Returns false if
  * out_len is too small. */
 bool sbg_format_progress(uint64_t step, uint64_t total, char* out, size_t out_len);
+
+/* User-selected jurisdiction for the legal transmit check. The Flipper's own
+ * hardware region (furi_hal_region) only models 4 presets and can be
+ * unprovisioned entirely (observed on real hardware: "--", which fails
+ * closed on every frequency, including ones every preset allows) and has no
+ * entry for most countries, including Indonesia. This table is an explicit,
+ * user-visible, user-chosen alternative, not a replacement for the hardware
+ * check: both are applied together, see AGENTS.md "Region gating" section.
+ *
+ * SbgRegionEu/UsCaAu/Jp bands are copied verbatim from official firmware's
+ * own targets/f7/furi_hal/furi_hal_region.c. SbgRegionIndonesia is sourced
+ * from SDPPI Decree No. 260/2024's short-range-device WPAN band assignments
+ * (314-316 MHz, 433-434.79 MHz, 920-923 MHz) via secondary regulatory
+ * summaries, not the decree text directly - verify against the current
+ * decree before relying on this for real-world authorized testing.
+ * SbgRegionUnrestricted mirrors firmware's own "00"/developer region
+ * (0-1000 MHz, fully open) and is for lab-bench use only. */
+typedef enum {
+    SbgRegionUnrestricted,
+    SbgRegionEu,
+    SbgRegionUsCaAu,
+    SbgRegionJp,
+    SbgRegionIndonesia,
+    SbgRegionCount,
+} SbgRegionId;
+
+#define SBG_MAX_BANDS 3
+
+typedef struct {
+    uint32_t start_hz;
+    uint32_t end_hz;
+} SbgBand;
+
+typedef struct {
+    const char* label;
+    SbgBand bands[SBG_MAX_BANDS];
+    uint8_t band_count;
+} SbgRegion;
+
+const SbgRegion* sbg_region(SbgRegionId id);
+
+/* True if `freq_hz` falls within any of the region's allowed bands
+ * (inclusive of both endpoints, matching furi_hal_region's own
+ * convention). */
+bool sbg_region_allows(SbgRegionId id, uint32_t freq_hz);

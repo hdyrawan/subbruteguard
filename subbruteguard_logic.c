@@ -27,7 +27,7 @@ static const SbgProtocol SBG_PROTOCOLS[SbgProtoCount] = {
          .frequencies_hz = {433920000, 868350000},
          .frequency_count = 2},
     [SbgProtoChamberlain9] =
-        {.label = "Chamberlain 9-bit",
+        {.label = "Cham 9-bit",
          .sub_protocol = "Cham_Code",
          .bits = 9,
          .encoding = SbgEncodingBinary,
@@ -37,7 +37,7 @@ static const SbgProtocol SBG_PROTOCOLS[SbgProtoCount] = {
          .frequencies_hz = {300000000, 315000000, 318000000, 390000000, 433920000},
          .frequency_count = 5},
     [SbgProtoChamberlain8] =
-        {.label = "Chamberlain 8-bit",
+        {.label = "Cham 8-bit",
          .sub_protocol = "Cham_Code",
          .bits = 8,
          .encoding = SbgEncodingBinary,
@@ -47,7 +47,7 @@ static const SbgProtocol SBG_PROTOCOLS[SbgProtoCount] = {
          .frequencies_hz = {300000000, 315000000, 390000000},
          .frequency_count = 3},
     [SbgProtoChamberlain7] =
-        {.label = "Chamberlain 7-bit",
+        {.label = "Cham 7-bit",
          .sub_protocol = "Cham_Code",
          .bits = 7,
          .encoding = SbgEncodingBinary,
@@ -169,4 +169,35 @@ bool sbg_format_progress(uint64_t step, uint64_t total, char* out, size_t out_le
     int written =
         snprintf(out, out_len, "%llu/%llu", (unsigned long long)step, (unsigned long long)total);
     return written > 0 && (size_t)written < out_len;
+}
+
+static const SbgRegion SBG_REGIONS[SbgRegionCount] = {
+    [SbgRegionUnrestricted] =
+        {.label = "Unrestricted (lab)", .bands = {{0, 1000000000}}, .band_count = 1},
+    [SbgRegionEu] =
+        {.label = "EU", .bands = {{433050000, 434790000}, {868150000, 868550000}}, .band_count = 2},
+    [SbgRegionUsCaAu] =
+        {.label = "US/CA/AU",
+         .bands = {{304100000, 321950000}, {433050000, 434790000}, {915000000, 928000000}},
+         .band_count = 3},
+    [SbgRegionJp] =
+        {.label = "Japan",
+         .bands = {{312000000, 315250000}, {920500000, 923500000}},
+         .band_count = 2},
+    [SbgRegionIndonesia] =
+        {.label = "Indonesia",
+         .bands = {{314000000, 316000000}, {433000000, 434790000}, {920000000, 923000000}},
+         .band_count = 3},
+};
+
+const SbgRegion* sbg_region(SbgRegionId id) {
+    return &SBG_REGIONS[id];
+}
+
+bool sbg_region_allows(SbgRegionId id, uint32_t freq_hz) {
+    const SbgRegion* r = &SBG_REGIONS[id];
+    for(uint8_t i = 0; i < r->band_count; i++) {
+        if(freq_hz >= r->bands[i].start_hz && freq_hz <= r->bands[i].end_hz) return true;
+    }
+    return false;
 }

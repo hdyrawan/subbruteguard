@@ -4,8 +4,10 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <lib/flipper_format/flipper_format.h>
-#include <lib/subghz/devices/cc1101_configs.h>
+#include <lib/subghz/devices/cc1101_int/cc1101_int_interconnect.h>
+#include <lib/subghz/devices/devices.h>
 #include <lib/subghz/environment.h>
+#include <lib/subghz/subghz_protocol_registry.h>
 #include <lib/subghz/transmitter.h>
 #include <storage/storage.h>
 
@@ -18,6 +20,7 @@
 
 typedef enum {
     SbgViewIntro,
+    SbgViewRegion,
     SbgViewPick,
     SbgViewRunning,
     SbgViewPaused,
@@ -40,6 +43,7 @@ typedef struct {
     FuriTimer* timer;
 
     SbgView view;
+    SbgRegionId region;
     SbgProtocolId protocol;
     uint8_t freq_index;
     uint64_t step;
@@ -49,6 +53,7 @@ typedef struct {
     Gui* gui;
     ViewPort* view_port;
     Storage* storage;
+    const SubGhzDevice* radio_device;
 } SbgApp;
 
 /* Persist {protocol, freq_index, step} so a long run survives a battery swap
@@ -59,7 +64,8 @@ static void sbg_checkpoint_save(SbgApp* app) {
     File* file = storage_file_alloc(app->storage);
     if(storage_file_open(file, CHECKPOINT_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         FuriString* line = furi_string_alloc_printf(
-            "%u %u %llu\n",
+            "%u %u %u %llu\n",
+            (unsigned)app->region,
             (unsigned)app->protocol,
             (unsigned)app->freq_index,
             (unsigned long long)app->step);
@@ -76,9 +82,11 @@ static void sbg_checkpoint_load(SbgApp* app) {
         char buf[64] = {0};
         uint16_t read = storage_file_read(file, buf, sizeof(buf) - 1);
         if(read > 0) {
-            unsigned proto = 0, freq = 0;
+            unsigned region = 0, proto = 0, freq = 0;
             unsigned long long step = 0;
-            if(sscanf(buf, "%u %u %llu", &proto, &freq, &step) == 3 && proto < SbgProtoCount) {
+            if(sscanf(buf, "%u %u %u %llu", &region, &proto, &freq, &step) == 4 &&
+               region < SbgRegionCount && proto < SbgProtoCount) {
+                app->region = (SbgRegionId)region;
                 app->protocol = (SbgProtocolId)proto;
                 const SbgProtocol* p = sbg_protocol(app->protocol);
                 app->freq_index = (freq < p->frequency_count) ? (uint8_t)freq : 0;
@@ -91,15 +99,29 @@ static void sbg_checkpoint_load(SbgApp* app) {
     storage_file_free(file);
 }
 
-/* Both calls are defense in depth: furi_hal_subghz_start_async_tx already
- * refuses on an out-of-region frequency, but we check first so a blocked
- * attempt shows a plain reason instead of a transmit that silently no-ops. */
-static bool sbg_frequency_allowed(uint32_t freq) {
-    return furi_hal_region_is_frequency_allowed(freq) && furi_hal_subghz_is_frequency_valid(freq);
+/* Three independent checks, not one: furi_hal_subghz_is_frequency_valid is
+ * the hardware's physical tuning range, always required. sbg_region_allows
+ * is the user's own explicit jurisdiction choice (see subbruteguard_logic.h
+ * for why this exists instead of relying on furi_hal_region alone: it has
+ * no Indonesia entry, and this app has shipped on hardware observed to have
+ * no region provisioned at all, which fails every frequency unconditionally
+ * even ones every real preset allows). furi_hal_region_is_frequency_allowed
+ * is only consulted when the hardware actually has a provisioned region, as
+ * an extra belt on top of the user's choice, not instead of it — an
+ * unprovisioned "--" state must not be allowed to silently defeat an
+ * app that exists specifically to let the user make this choice explicitly. */
+static bool sbg_frequency_allowed(SbgRegionId region, uint32_t freq) {
+    if(!furi_hal_subghz_is_frequency_valid(freq)) return false;
+    if(!sbg_region_allows(region, freq)) return false;
+    if(furi_hal_region_is_provisioned() && !furi_hal_region_is_frequency_allowed(freq)) {
+        return false;
+    }
+    return true;
 }
 
-static bool sbg_send_one_code(SbgApp* app, uint32_t freq, const SbgProtocol* proto) {
-    if(!sbg_frequency_allowed(freq)) return false;
+static bool
+    sbg_send_one_code(SbgApp* app, SbgRegionId region, uint32_t freq, const SbgProtocol* proto) {
+    if(!sbg_frequency_allowed(region, freq)) return false;
 
     char key_hex[32];
     sbg_candidate_hex(app->protocol, app->step, key_hex, sizeof(key_hex));
@@ -118,28 +140,42 @@ static bool sbg_send_one_code(SbgApp* app, uint32_t freq, const SbgProtocol* pro
         uint32_t te = proto->te_us;
         flipper_format_write_uint32(ff, "TE", &te, 1);
     }
+    uint32_t repeat = proto->repeat;
+    flipper_format_write_uint32(ff, "Repeat", &repeat, 1);
     flipper_format_rewind(ff);
 
+    /* subghz_environment_set_protocol_registry is not optional: without it
+     * the environment has no protocol table to resolve proto->sub_protocol
+     * against. An earlier version of this function skipped it, and the
+     * resulting transmitter crashed the device with "furi_check failed" on
+     * real hardware the first time an armed run actually transmitted - not
+     * a theory, confirmed by reproducing and fixing it. This sequence
+     * (environment -> registry -> transmitter -> deserialize, then
+     * subghz_devices_* for the radio, never furi_hal_subghz_* directly) is
+     * copied from official firmware's own "subghz tx" CLI command
+     * (applications/main/subghz/subghz_cli.c), the one place in the
+     * firmware source that builds and sends a key file exactly like this
+     * app does. Do not "simplify" this back to raw furi_hal_subghz_* calls. */
     SubGhzEnvironment* env = subghz_environment_alloc();
+    subghz_environment_set_protocol_registry(env, &subghz_protocol_registry);
     SubGhzTransmitter* tx = subghz_transmitter_alloc_init(env, proto->sub_protocol);
     bool ok = tx != NULL && subghz_transmitter_deserialize(tx, ff) == SubGhzProtocolStatusOk;
 
     if(ok) {
-        furi_hal_subghz_reset();
-        furi_hal_subghz_idle();
-        furi_hal_subghz_load_custom_preset(subghz_device_cc1101_preset_ook_650khz_async_regs);
-        furi_hal_subghz_set_frequency_and_path(freq);
+        subghz_devices_begin(app->radio_device);
+        subghz_devices_reset(app->radio_device);
+        subghz_devices_load_preset(app->radio_device, FuriHalSubGhzPresetOok650Async, NULL);
+        subghz_devices_set_frequency(app->radio_device, freq);
 
-        for(uint8_t r = 0; r < proto->repeat && ok; r++) {
-            ok = furi_hal_subghz_start_async_tx(subghz_transmitter_yield, tx);
-            if(ok) {
-                while(!furi_hal_subghz_is_async_tx_complete()) {
-                    furi_delay_ms(1);
-                }
-                furi_hal_subghz_stop_async_tx();
+        ok = subghz_devices_start_async_tx(app->radio_device, subghz_transmitter_yield, tx);
+        if(ok) {
+            while(!subghz_devices_is_async_complete_tx(app->radio_device)) {
+                furi_delay_ms(1);
             }
+            subghz_devices_stop_async_tx(app->radio_device);
         }
-        furi_hal_subghz_idle();
+        subghz_devices_idle(app->radio_device);
+        subghz_devices_end(app->radio_device);
     }
 
     if(tx) subghz_transmitter_free(tx);
@@ -149,6 +185,8 @@ static bool sbg_send_one_code(SbgApp* app, uint32_t freq, const SbgProtocol* pro
     FURI_LOG_D(TAG, "step %llu key %s ok=%d", (unsigned long long)app->step, key_hex, ok);
     return ok;
 }
+
+static const char* sbg_region_badge(SbgRegionId id);
 
 static void sbg_draw_callback(Canvas* canvas, void* ctx) {
     SbgApp* app = ctx;
@@ -169,8 +207,23 @@ static void sbg_draw_callback(Canvas* canvas, void* ctx) {
         return;
     }
 
+    if(app->view == SbgViewRegion) {
+        const SbgRegion* r = sbg_region(app->region);
+        canvas_draw_str(canvas, 2, 10, "SubBruteGuard");
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 22, "Pick your jurisdiction:");
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str(canvas, 2, 36, r->label);
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 48, "Up/Down: change");
+        canvas_draw_str(canvas, 2, 61, "OK: confirm  Back: exit");
+        furi_mutex_release(app->mutex);
+        return;
+    }
+
     const SbgProtocol* p = sbg_protocol(app->protocol);
     canvas_draw_str(canvas, 2, 10, "SubBruteGuard");
+    canvas_draw_str(canvas, 100, 10, sbg_region_badge(app->region));
     canvas_set_font(canvas, FontSecondary);
 
     char freq_line[32];
@@ -219,6 +272,30 @@ static void sbg_timer_callback(void* ctx) {
     furi_message_queue_put(app->queue, &event, 0);
 }
 
+/* Short badge drawn next to the title so the active jurisdiction is always
+ * visible, not just on the one-time region-picker screen. */
+static const char* sbg_region_badge(SbgRegionId id) {
+    switch(id) {
+    case SbgRegionUnrestricted:
+        return "LAB";
+    case SbgRegionEu:
+        return "EU";
+    case SbgRegionUsCaAu:
+        return "US";
+    case SbgRegionJp:
+        return "JP";
+    case SbgRegionIndonesia:
+        return "ID";
+    default:
+        return "";
+    }
+}
+
+static void sbg_advance_region(SbgApp* app, int delta) {
+    int next = ((int)app->region + delta + SbgRegionCount) % SbgRegionCount;
+    app->region = (SbgRegionId)next;
+}
+
 static void sbg_advance_protocol(SbgApp* app, int delta) {
     int next = ((int)app->protocol + delta + SbgProtoCount) % SbgProtoCount;
     app->protocol = (SbgProtocolId)next;
@@ -239,12 +316,16 @@ int32_t subbruteguard_app(void* p) {
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     app->queue = furi_message_queue_alloc(8, sizeof(SbgEvent));
     app->view = SbgViewIntro;
+    app->region = SbgRegionIndonesia;
     app->protocol = SbgProtoCame12;
     app->freq_index = 0;
     app->step = 0;
     app->total_steps = sbg_total_steps(app->protocol);
     app->running = false;
     app->storage = furi_record_open(RECORD_STORAGE);
+
+    subghz_devices_init();
+    app->radio_device = subghz_devices_get_by_name(SUBGHZ_DEVICE_CC1101_INT_NAME);
 
     sbg_checkpoint_load(app);
 
@@ -271,7 +352,7 @@ int32_t subbruteguard_app(void* p) {
                 uint32_t freq = proto->frequencies_hz[app->freq_index];
                 furi_mutex_release(app->mutex);
 
-                bool sent = sbg_send_one_code(app, freq, proto);
+                bool sent = sbg_send_one_code(app, app->region, freq, proto);
 
                 furi_mutex_acquire(app->mutex, FuriWaitForever);
                 if(!sent) {
@@ -288,17 +369,21 @@ int32_t subbruteguard_app(void* p) {
             InputEvent* in = &event.input;
 
             if(app->view == SbgViewIntro) {
-                if(in->type == InputTypeRelease) app->view = SbgViewPick;
+                if(in->type == InputTypeRelease) app->view = SbgViewRegion;
             } else if(in->type == InputTypeShort) {
                 switch(in->key) {
                 case InputKeyUp:
-                    if(app->view == SbgViewPick || app->view == SbgViewBlocked) {
+                    if(app->view == SbgViewRegion) {
+                        sbg_advance_region(app, 1);
+                    } else if(app->view == SbgViewPick || app->view == SbgViewBlocked) {
                         sbg_advance_protocol(app, 1);
                         app->view = SbgViewPick;
                     }
                     break;
                 case InputKeyDown:
-                    if(app->view == SbgViewPick || app->view == SbgViewBlocked) {
+                    if(app->view == SbgViewRegion) {
+                        sbg_advance_region(app, -1);
+                    } else if(app->view == SbgViewPick || app->view == SbgViewBlocked) {
                         sbg_advance_protocol(app, -1);
                         app->view = SbgViewPick;
                     }
@@ -316,13 +401,19 @@ int32_t subbruteguard_app(void* p) {
                     }
                     break;
                 case InputKeyOk:
-                    if(app->view == SbgViewPaused) app->view = SbgViewRunning;
+                    if(app->view == SbgViewRegion) {
+                        app->view = SbgViewPick;
+                    } else if(app->view == SbgViewPaused) {
+                        app->view = SbgViewRunning;
+                    }
                     break;
                 case InputKeyBack:
                     if(app->view == SbgViewRunning) {
                         app->view = SbgViewPaused;
                         sbg_checkpoint_save(app);
-                    } else if(app->view == SbgViewPick || app->view == SbgViewBlocked) {
+                    } else if(
+                        app->view == SbgViewPick || app->view == SbgViewBlocked ||
+                        app->view == SbgViewRegion) {
                         exit_requested = true;
                     } else if(app->view == SbgViewPaused) {
                         exit_requested = true;
@@ -357,6 +448,7 @@ int32_t subbruteguard_app(void* p) {
     furi_record_close(RECORD_GUI);
     view_port_free(app->view_port);
 
+    subghz_devices_deinit();
     furi_record_close(RECORD_STORAGE);
     furi_message_queue_free(app->queue);
     furi_mutex_free(app->mutex);

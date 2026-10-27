@@ -25,13 +25,39 @@ it runs on an unmodified Flipper.
 **This is an active transmit tool. Treat it as more dangerous than a passive
 app by default:**
 
-- Every single candidate, not just the session as a whole, is checked against
-  **both** `furi_hal_region_is_frequency_allowed(freq)` and
-  `furi_hal_subghz_is_frequency_valid(freq)` before any TX call. The HAL
-  itself also refuses `furi_hal_subghz_start_async_tx` on a disallowed
-  frequency, so this is defense in depth, not the only gate — but never
-  remove the explicit app-level check to "simplify" the TX path; it's the
-  reason a blocked session shows a clear reason instead of a silent stall.
+- Every single candidate, not just the session as a whole, is checked by
+  `sbg_frequency_allowed()` (three conditions, all required):
+  1. `furi_hal_subghz_is_frequency_valid(freq)` — the CC1101's physical
+     tuning range, always required, never optional.
+  2. `sbg_region_allows(app->region, freq)` — the **user's own explicit
+     jurisdiction choice**, picked on a dedicated screen shown once per
+     launch, right after the intro and before the protocol/frequency
+     picker. This exists because `furi_hal_region` only models 4 hardware
+     presets (EU, US/CA/AU, JP, "00"/developer) and has no entry for most
+     countries, including Indonesia — and because a real test unit was
+     observed with `hardware_region_provisioned: --` (no region data at
+     all), which makes `furi_hal_region_is_frequency_allowed` fail closed
+     on every single frequency unconditionally, including ones every real
+     preset allows. An app whose whole purpose is letting a user test
+     fixed-code remotes should not be silently unusable because a device's
+     region fuse is unset; it should ask the user where they are. See
+     `subbruteguard_logic.h`'s `SbgRegionId` doc comment for the source of
+     each region's band table (EU/US/JP copied verbatim from official
+     firmware's own `furi_hal_region.c`; Indonesia sourced from SDPPI
+     Decree No. 260/2024's SRD band assignments via secondary regulatory
+     summaries — flagged there as needing verification against the current
+     decree text before relying on it for real authorized testing).
+  3. `furi_hal_region_is_frequency_allowed(freq)` — only consulted when
+     `furi_hal_region_is_provisioned()` is true. When the hardware has no
+     provisioned region, this check is skipped rather than treated as an
+     automatic "no," precisely because that state was observed to block
+     everything regardless of the user's actual jurisdiction. When the
+     hardware does have a provisioned region, this is an extra belt on top
+     of the user's choice, not a replacement for it — the HAL itself also
+     refuses `furi_hal_subghz_start_async_tx` on a disallowed frequency, so
+     this layer is defense in depth. Never remove any of the three checks
+     to "simplify" the TX path; each one closes a specific, documented gap
+     the other two don't cover.
 - Starting a run requires a **long press** of OK from the picker, never a
   short press. Up/Down/Left/Right (protocol and frequency selection) are all
   short presses. This asymmetry is deliberate: it must not be possible to
@@ -92,6 +118,36 @@ both PT2260 and PT2262 — share a `sub_protocol` name too (`"SMC5326"` and
 table maps them that way: UNILARM and PT2262 are gate/button variants of the
 same underlying encoder, not distinct ones.
 
+**The `SubGhzTransmitter` encoder is a one-shot generator, not something safe
+to restart.** `proto->repeat` is written into the `FlipperFormat` as a
+`Repeat:` field and consumed by the encoder during
+`subghz_transmitter_deserialize` — the encoder generates that many
+repetitions itself during a single `furi_hal_subghz_start_async_tx` /
+`is_async_tx_complete` / `stop_async_tx` session. `start_async_tx` is called
+**exactly once** per transmission, matching official firmware's own call
+pattern in `applications/main/subghz/subghz_cli.c`. An earlier version of
+`sbg_send_one_code` called `start_async_tx` in a manual `for` loop over
+`proto->repeat`, reusing the same transmitter object without re-deserializing
+between calls — this crashed real hardware with `furi_check failed`
+(confirmed on device, not a theory) the first time an armed run actually
+transmitted. Do not reintroduce a manual repeat loop around `start_async_tx`;
+if a protocol needs more repeats, raise `Repeat:`, don't call TX again.
+
+## Screen flow
+
+`SbgViewIntro` -> `SbgViewRegion` -> `SbgViewPick` -> (`SbgViewRunning` <->
+`SbgViewPaused`, or `SbgViewBlocked`). The region picker is a mandatory stop
+between the intro and the protocol/frequency picker on every launch — it is
+not skippable and does not persist a "don't ask again" choice, because the
+jurisdiction choice is the thing standing in for the hardware's own
+(frequently absent or wrong) region data; skipping it would silently fall
+back to whatever `app->region` happened to default to. The selected
+region's two-or-three-letter badge (`sbg_region_badge`) is drawn at x=100,
+baseline y=10, next to the title, on every screen after the region picker —
+it's a legibility aid so the active jurisdiction is never just something you
+set once and forgot, the same reasoning bleepsentry's WATCH/SWEEP badge
+documents for mode legibility.
+
 ## Build, test, device loop
 
 ```
@@ -148,11 +204,12 @@ Pitfalls carried over from the bleepsentry sibling project, still true here:
 A brute-force run over a real key space can span many thousands of codes;
 `CHECKPOINT_PERIOD` (50) codes between SD card writes is a deliberate
 trade-off between resume granularity and not stalling TX cadence on slow SD
-I/O. Checkpoint format is plain text, `protocol_id freq_index step`, one
-line, overwritten each time — see `sbg_checkpoint_save`/`sbg_checkpoint_load`.
-If you change the protocol table's ordering or add a protocol in the middle
-of the enum, any checkpoint written by an older build becomes meaningless
-(the index points at a different protocol); that's accepted as a known
+I/O. Checkpoint format is plain text, `region_id protocol_id freq_index step`,
+one line, overwritten each time — see
+`sbg_checkpoint_save`/`sbg_checkpoint_load`. If you change the protocol
+table's or `SbgRegionId`'s ordering, or add an entry in the middle of either
+enum, any checkpoint written by an older build becomes meaningless (the
+index points at a different protocol or region); that's accepted as a known
 limitation for a pre-1.0 app, not something to add migration code for.
 
 ## Catalog submission
